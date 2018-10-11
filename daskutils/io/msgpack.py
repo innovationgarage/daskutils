@@ -12,7 +12,7 @@ def read(filenames):
     return filenames.map(lambda x: read(x)).flatten()    
 
 def write(data, filepattern):
-    data = daskutils.base.enumerate(glom(data))
+    data = daskutils.base.enumerate(daskutils.base.glom(data))
     @data.map
     def write(item):
         lines, idx = item

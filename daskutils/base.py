@@ -2,10 +2,18 @@ import dask.bag
 import dask.distributed
 
 def glom(bag):
-    return bag.map_partitions(lambda i: [i])
+    return bag.map_partitions(lambda i: [list(i)])
 
 def enumerate(data):
-    return dask.bag.zip(data, db.range(data.count().compute(), data.npartitions))
+    if data.npartitions == 0:
+        return data
+    return dask.bag.zip(data, dask.bag.range(data.count().compute(), data.npartitions))
+
+def glom_enumerate(data):
+    if data.npartitions == 0:
+        return data
+    data = glom(data)
+    return dask.bag.zip(data, dask.bag.range(data.npartitions, data.npartitions))
 
 def bag_glom(bag):
     return bag.map_partitions(lambda i: [dask.bag.from_sequence(i)])
