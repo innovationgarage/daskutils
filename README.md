@@ -39,7 +39,10 @@ from the two closest items.
 
 # daskutils.sort.MergeSort
 
-This is a O(n * log(n) / k) standard merge sort implementation (where k is number of nodes) for dask bags.
+This is a O(n * log(n)) standard merge sort implementation for dask bags. It is not bound by the total amount of ram
+in your cluster. Many steps are parallelized, so that the complexity approaches O(n * log(n)/k) where k is number of nodes.
+However, currently the final merge is not parallelized. The sort implementation needs a directory shared between all nodes
+(e.g. mounted over nfs, smb or ceph) for temporary files:
 
     sorter = daskutils.sort.MergeSort("/path/to/tmpdir", lambda item: iten["sortkey"], partition_size=2000)
     sorted_dask_bag = sorter.sort(unsorted_dask_bag)
