@@ -1,13 +1,31 @@
-import daskutils.math
-import daskutils.base
-import daskutils.io.msgpack
 import dask.bag
 import dask.distributed
 import os.path
 import uuid
 import msgpack
 import itertools
- 
+import socket
+import contextlib
+import subprocess
+
+@contextlib.contextmanager
+def debugopen(filename, *arg, **kw):
+    try:
+        with open(filename, *arg, **kw) as f:
+            yield f
+    except FileNotFoundError:
+        base = existing_base(filename)
+        hostname = socket.gethostname()
+        #with open("/etc/host-hostname") as f:
+        #    hostname = f.read().strip()
+        raise FileNotFoundError("%s:%s: only %s exists, containing %s" % (hostname, filename, base, os.listdir(base)))
+
+def existing_base(path):
+    while path != "/":
+        if os.path.exists(path):
+            return path
+        path = os.path.split(path)[0]
+    assert False
 
 def merge(a, b, key):
     """Merges data from two iterators of sorted values into one
@@ -46,7 +64,9 @@ class SortUnit(object):
         self.data = data
         self.a = a
         self.b = b
-
+        assert not isinstance(minval, float)
+        assert not isinstance(maxval, float)
+        
     def construct(self, *arg, **kwarg):
         return SortUnit(self.mergesort, *arg, **kwarg)
         
@@ -114,23 +134,29 @@ class SortUnit(object):
         assert self.data
 
         tempdir = self.mergesort.tempdir
-        key = self.mergesort.key
+        
+        splitline = self.mergesort.formatkey(value).decode("utf-8") + "||SPLIT"
 
-        aout = self.construct(minval=self.minval, count=0, data=os.path.join(tempdir, "%s.msgpack" % (str(uuid.uuid4()),)))
-        bout = self.construct(minval=value, count=0, maxval=self.maxval, data=os.path.join(tempdir, "%s.msgpack" % (str(uuid.uuid4()),)))
+        splitname = os.path.join(tempdir, str(uuid.uuid4()))
+        subprocess.check_call(["bash", "-c", """
+          sort -k %(keydef)s -m "%(data)s" <(echo "%(split)s") |
+            sed '1,/%(split)s/w '>(head -n -1 > "%(splitname)sa")'\n/%(split)s/,$w '>(tail -n +2 > "%(splitname)sb")'' > /dev/null
+        """ % {
+            "keydef": self.mergesort.keydef,
+            "data": self.data,
+            "split": splitline,
+            "splitname": splitname
+        }])
+        amaxval = self.mergesort.itemkey(
+            self.mergesort.loads(
+                subprocess.check_output(["tail", "-n", "1", splitname + "a"]).split(b"||")[1]))
+
+        alen = int(subprocess.check_output(["wc", "-l", splitname + "a"]).split(b" ")[0])
+        blen = int(subprocess.check_output(["wc", "-l", splitname + "b"]).split(b" ")[0])
         
-        with open(self.data, 'rb') as f:
-            with open(aout.data, 'wb') as aof:
-                with open(bout.data, 'wb') as bof:
-                    for line in msgpack.Unpacker(f, raw=False):
-                        if key(line) < value:
-                            msgpack.dump(line, aof)
-                            aout.maxval=key(line)
-                            aout.count += 1
-                        else:
-                            msgpack.dump(line, bof)
-                            bout.count += 1
-        
+        aout = self.construct(minval=self.minval, maxval=amaxval, count=alen, data=splitname + "a")
+        bout = self.construct(minval=value, maxval=self.maxval, count=blen, data=splitname + "b")
+
         return aout, bout
             
     @dask.delayed
@@ -145,34 +171,30 @@ class SortUnit(object):
         tempdir = self.mergesort.tempdir
         key = self.mergesort.key
 
-        aout = self.construct(count=0, data=os.path.join(tempdir, "%s.msgpack" % (str(uuid.uuid4()),)))
-        bout = self.construct(count=0, data=os.path.join(tempdir, "%s.msgpack" % (str(uuid.uuid4()),)))
-        
-        with open(self.data, 'rb') as af:
-            with open(other.data, 'rb') as bf:
-                with open(aout.data, 'wb') as aof:
-                    with open(bout.data, 'wb') as bof:
-                        merged = iter(enumerate(merge(
-                            msgpack.Unpacker(af, raw=False),
-                            msgpack.Unpacker(bf, raw=False),
-                            key)))
-                        
-                        for idx, line in merged:
-                            if idx < self.mergesort.partition_size:
-                                out = aout
-                                of = aof
-                            else:
-                                out = bout
-                                of = bof
-                            if out.minval is None:
-                                out.minval = key(line)
-                            out.maxval = key(line)
-                            out.count += 1
-                            msgpack.dump(line, of)
+        mergedname = os.path.join(tempdir, str(uuid.uuid4()))
+        subprocess.check_call(["sort", "-k", self.mergesort.keydef, "-o", mergedname, "-m", self.data, other.data])
+
+        subprocess.check_call(["split", "-n", "l/2", mergedname, mergedname])
+
+        aout = self.construct(count=0, data=mergedname + "aa")
+        bout = self.construct(count=0, data=mergedname + "ab")        
+
+        for out in (aout, bout):
+            with debugopen(out.data, 'rb') as f:
+                for line in f:
+                    if out.minval is None:
+                        out.minval = self.mergesort.itemkey(self.mergesort.loads(line.split(b"||", 1)[1]))
+                    out.count += 1
+                out.maxval = self.mergesort.itemkey(self.mergesort.loads(line.split(b"||", 1)[1]))
 
         if bout.count == 0:
             return aout
-                            
+
+        assert isinstance(aout.minval, tuple)
+        assert isinstance(bout.minval, tuple)
+        assert isinstance(aout.maxval, tuple)
+        assert isinstance(bout.maxval, tuple)
+        
         return self.construct(
             minval=min(aout.minval, bout.minval),
             maxval=max(aout.maxval, bout.maxval),
@@ -180,19 +202,24 @@ class SortUnit(object):
             a=aout,
             b=bout)
 
-    def traverse(self):
+    def flatten(self):
         if self.data:
-            yield self.read()
+            yield self
         else:
             for child in (self.a, self.b):
-                for item in child.traverse():
+                for item in child.flatten():
                     yield item
 
-    @dask.delayed
     def read(self):
         assert self.data
-        with open(self.data, 'rb') as f:
-            return list(msgpack.Unpacker(f, raw=False))
+        with debugopen(self.data, 'rb') as f:
+            for line in f:
+                try:
+                    yield self.mergesort.loads(line.split(b"||", 1)[1])
+                except:
+                    print(self.data)
+                    print(line)
+                    raise
         
 class MergeSort(object):
     def __init__(self, tempdir, key=lambda a: a, partition_size=2000):
@@ -201,27 +228,62 @@ class MergeSort(object):
         self.partition_size = partition_size
         
     def sort(self, data):
-        sort_units = [self.partition_to_sort_unit(part)
-                      for part in data.to_delayed()]
-        sort_unit = self.merge_sort(sort_units)
+        keytypes = ["n" if type(keypart) in (int, float) else ""
+                    for keypart in self.itemkey(data.take(1)[0])]
+        self.keydef = ",".join("%s%s" % (idx+1, keytype) for (idx, keytype) in enumerate(keytypes))
+
+        sort_units = data.map_partitions(self.partition_to_sort_unit).compute()
+        sort_unit = self.merge_sort([dask.delayed(sort_unit) for sort_unit in sort_units])
         sort_unit = sort_unit.compute()
 
-        data = sort_unit.traverse()
-        data = dask.bag.from_delayed(data)
+        data = dask.bag.from_sequence(sort_unit.flatten(), 1)
+        
+        @data.map_partitions
+        def data(part):
+            return part[0].read()
         
         return data
 
-    @dask.delayed
-    def partition_to_sort_unit(self, data):
-        filename = os.path.join(self.tempdir, "%s.msgpack" % (str(uuid.uuid4()),))
+    def dumps(self, item):
+        return msgpack.dumps(item).replace(b"\\", br"\\").replace(b"\n", br"\n")
 
-        data = sorted(data, key=self.key)
+    def loads(self, line):
+        return msgpack.loads(line.strip(b"\n").replace(br"\n", b"\n").replace(br"\\", b"\\"), raw=False)            
         
-        with open(filename, 'wb') as f:
-            for item in data:
-                msgpack.dump(item, f)
+    def itemkey(self, item):
+        itemkey = self.key(item)
+        if not isinstance(itemkey, (tuple, list)):
+            itemkey = (itemkey,)
+        return itemkey
+    
+    def formatkey(self, itemkey):
+        return b"|".join(str(keypart).encode("utf-8") for keypart in itemkey)
+        
+    def partition_to_sort_unit(self, data):
+        filename = os.path.join(self.tempdir, str(uuid.uuid4()))
 
-        return self.sort_unit(minval=self.key(data[0]), maxval=self.key(data[-1]), count=len(data), data=filename)
+        minval = None
+        maxval = None
+        count = 0
+        with debugopen(filename, 'wb') as f:
+            for item in data:
+                count += 1
+                itemkey = self.key(item)
+                if not isinstance(itemkey, (tuple, list)):
+                    itemkey = (itemkey,)
+                if minval is None:
+                    minval = itemkey
+                if maxval is None or itemkey > maxval:
+                    maxval = itemkey
+                f.write(self.formatkey(itemkey))
+                f.write(b"||")
+                f.write(self.dumps(item))
+                f.write(b"\n")
+                
+        sortedname = filename + ".sorted"
+        subprocess.check_call(["sort", "-k", self.keydef, "-o", sortedname, filename])
+        
+        return [self.sort_unit(minval=minval, maxval=maxval, count=count, data=sortedname)]
     
     def sort_unit(self, *arg, **kwarg):
         return SortUnit(self, *arg, **kwarg)
