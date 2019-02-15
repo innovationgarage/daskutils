@@ -116,8 +116,8 @@ class SortUnit(object):
         tempdir = self.mergesort.tempdir
         key = self.mergesort.key
 
-        aout = self.construct(minval=self.minval, count=0, data=os.path.join(tempdir, "%s.msgpack" % (str(uuid.uuid4()),)))
-        bout = self.construct(minval=value, count=0, maxval=self.maxval, data=os.path.join(tempdir, "%s.msgpack" % (str(uuid.uuid4()),)))
+        aout = self.construct(minval=self.minval, count=0, data=self.mergesort.tempfile(self.data, op="split"))
+        bout = self.construct(minval=value, count=0, maxval=self.maxval, data=self.mergesort.tempfile(self.data, op="split"))
         
         with open(self.data, 'rb') as f:
             with open(aout.data, 'wb') as aof:
@@ -145,8 +145,8 @@ class SortUnit(object):
         tempdir = self.mergesort.tempdir
         key = self.mergesort.key
 
-        aout = self.construct(count=0, data=os.path.join(tempdir, "%s.msgpack" % (str(uuid.uuid4()),)))
-        bout = self.construct(count=0, data=os.path.join(tempdir, "%s.msgpack" % (str(uuid.uuid4()),)))
+        aout = self.construct(count=0, data=self.mergesort.tempfile(self.data, other.data, op="merge"))
+        bout = self.construct(count=0, data=self.mergesort.tempfile(self.data, other.data, op="merge"))
         
         with open(self.data, 'rb') as af:
             with open(other.data, 'rb') as bf:
@@ -199,10 +199,23 @@ class MergeSort(object):
         self.tempdir = tempdir
         self.key = key
         self.partition_size = partition_size
+
+    def tempfile(self, *parents, **kw):
+        fileid = str(uuid.uuid4())[:4]
+        if "op" in kw:
+            fileid = fileid + "-" + kw["op"]
+        if parents:
+            parents = [os.path.split(parent)[1][:-len(".msgpack")].split("-")[0] for parent in parents]
+            if len(parents) == 1:
+                parents = parents[0]
+            else:
+                parents = "{%s}" % (",".join(parents))
+            fileid = fileid + "-" + parents
+        return os.path.join(self.tempdir, "%s.msgpack" % (fileid,))
         
     def sort(self, data):
-        sort_units = [self.partition_to_sort_unit(part)
-                      for part in data.to_delayed()]
+        filenames = data.map_partitions(self.repartition_and_save)
+        sort_units = [dask.delayed(sort_unit) for sort_unit in filenames.map(self.file_to_sort_unit).compute()]
         sort_unit = self.merge_sort(sort_units)
         sort_unit = sort_unit.compute()
 
@@ -211,17 +224,34 @@ class MergeSort(object):
         
         return data
 
-    @dask.delayed
-    def partition_to_sort_unit(self, data):
-        filename = os.path.join(self.tempdir, "%s.msgpack" % (str(uuid.uuid4()),))
+    def repartition_and_save(self, data):
+        partitionid = self.tempfile()
+        files = []
+        f = None
+        p = 0
+        for idx, item in enumerate(data):
+            part = idx // self.partition_size
+            if f is None or part != p:
+                if f: f.close()
+                p = part
+                filename = self.tempfile(partitionid)
+                f = open(filename, 'wb')
+                files.append(filename)
+            msgpack.dump(item, f)
+        if f: f.close()
+        return files
+    
+    def file_to_sort_unit(self, filename):
+        outfilename = self.tempfile(filename, op="sort")
 
-        data = sorted(data, key=self.key)
-        
-        with open(filename, 'wb') as f:
+        with open(filename, 'rb') as inf:
+            data = sorted(msgpack.Unpacker(inf, raw=False), key=self.key)
+
+        with open(outfilename, 'wb') as outf:
             for item in data:
-                msgpack.dump(item, f)
-
-        return self.sort_unit(minval=self.key(data[0]), maxval=self.key(data[-1]), count=len(data), data=filename)
+                msgpack.dump(item, outf)
+                
+        return self.sort_unit(minval=self.key(data[0]), maxval=self.key(data[-1]), count=len(data), data=outfilename)
     
     def sort_unit(self, *arg, **kwarg):
         return SortUnit(self, *arg, **kwarg)
