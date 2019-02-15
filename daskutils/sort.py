@@ -195,7 +195,7 @@ class SortUnit(object):
             return list(msgpack.Unpacker(f, raw=False))
         
 class MergeSort(object):
-    def __init__(self, tempdir, key=lambda a: a, partition_size=2000):
+    def __init__(self, tempdir, key=lambda a: a, partition_size=100000):
         self.tempdir = tempdir
         self.key = key
         self.partition_size = partition_size
