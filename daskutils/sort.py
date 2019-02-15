@@ -7,7 +7,23 @@ import os.path
 import uuid
 import msgpack
 import itertools
+import contextlib
+import socket
  
+@contextlib.contextmanager
+def debugopen(filename, *arg, **kw):
+    try:
+        with open(filename, *arg, **kw) as f:
+            yield f
+    except FileNotFoundError:
+        base = existing_base(filename)
+        if os.path.exists("/etc/host-hostname"):
+            with open("/etc/host-hostname") as f:
+                hostname = f.read().strip()
+        else:
+            hostname = socket.gethostname()
+        raise FileNotFoundError("%s:%s: only %s exists, containing %s" % (hostname, filename, base, os.listdir(base)))
+
 
 def merge(a, b, key):
     """Merges data from two iterators of sorted values into one
@@ -119,9 +135,9 @@ class SortUnit(object):
         aout = self.construct(minval=self.minval, count=0, data=self.mergesort.tempfile(self.data, op="split"))
         bout = self.construct(minval=value, count=0, maxval=self.maxval, data=self.mergesort.tempfile(self.data, op="split"))
         
-        with open(self.data, 'rb') as f:
-            with open(aout.data, 'wb') as aof:
-                with open(bout.data, 'wb') as bof:
+        with debugopen(self.data, 'rb') as f:
+            with debugopen(aout.data, 'wb') as aof:
+                with debugopen(bout.data, 'wb') as bof:
                     for line in msgpack.Unpacker(f, raw=False):
                         if key(line) < value:
                             msgpack.dump(line, aof)
@@ -148,10 +164,10 @@ class SortUnit(object):
         aout = self.construct(count=0, data=self.mergesort.tempfile(self.data, other.data, op="merge"))
         bout = self.construct(count=0, data=self.mergesort.tempfile(self.data, other.data, op="merge"))
         
-        with open(self.data, 'rb') as af:
-            with open(other.data, 'rb') as bf:
-                with open(aout.data, 'wb') as aof:
-                    with open(bout.data, 'wb') as bof:
+        with debugopen(self.data, 'rb') as af:
+            with debugopen(other.data, 'rb') as bf:
+                with debugopen(aout.data, 'wb') as aof:
+                    with debugopen(bout.data, 'wb') as bof:
                         merged = iter(enumerate(merge(
                             msgpack.Unpacker(af, raw=False),
                             msgpack.Unpacker(bf, raw=False),
@@ -180,19 +196,19 @@ class SortUnit(object):
             a=aout,
             b=bout)
 
-    def traverse(self):
+    def flatten(self):
         if self.data:
-            yield self.read()
+            yield self
         else:
             for child in (self.a, self.b):
-                for item in child.traverse():
+                for item in child.flatten():
                     yield item
 
-    @dask.delayed
     def read(self):
         assert self.data
-        with open(self.data, 'rb') as f:
-            return list(msgpack.Unpacker(f, raw=False))
+        with debugopen(self.data, 'rb') as f:
+            for line in msgpack.Unpacker(f, raw=False):
+                yield line
         
 class MergeSort(object):
     def __init__(self, tempdir, key=lambda a: a, partition_size=100000):
@@ -219,9 +235,12 @@ class MergeSort(object):
         sort_unit = self.merge_sort(sort_units)
         sort_unit = sort_unit.compute()
 
-        data = sort_unit.traverse()
-        data = dask.bag.from_delayed(data)
+        data = dask.bag.from_sequence(sort_unit.flatten(), 1)
         
+        @data.map_partitions
+        def data(part):
+            return part[0].read()
+                
         return data
 
     def repartition_and_save(self, data):
@@ -244,10 +263,10 @@ class MergeSort(object):
     def file_to_sort_unit(self, filename):
         outfilename = self.tempfile(filename, op="sort")
 
-        with open(filename, 'rb') as inf:
+        with debugopen(filename, 'rb') as inf:
             data = sorted(msgpack.Unpacker(inf, raw=False), key=self.key)
 
-        with open(outfilename, 'wb') as outf:
+        with debugopen(outfilename, 'wb') as outf:
             for item in data:
                 msgpack.dump(item, outf)
                 
