@@ -65,30 +65,85 @@ class SortUnit(object):
 
     def construct(self, *arg, **kwarg):
         return SortUnit(self.mergesort, *arg, **kwarg)
-        
+
+    @classmethod
+    @dask.delayed
+    def merge2(cls, a, b):
+        return a.merge(b).compute()
+
+    def append(self, other):
+        if other is None:
+            return self
+        if self.minval < other.minval:
+            a, b = self, other
+        else:
+            a, b = other, self        
+        return self.construct(
+            minval=a.minval,
+            maxval=b.maxval,
+            count=a.count + b.count,
+            a=a,
+            b=b)
+    
     @dask.delayed
     def merge(self, other):
         # print("Merging %s[%s,%s] and %s[%s,%s]" % (self.count, self.minval, self.maxval, other.count, other.minval, other.maxval))
         if other is None:
             return self
+        elif self.maxval < other.minval:
+            return self.append(other)
+        elif other.maxval < self.minval:
+            return other.append(self)
         elif self.data and other.data:
             return self.merge_simple(other).compute()
-        elif self.data:
+        elif other.data:
+            return self.merge_splitted(other.split(self.b.minval)).compute()
+        elif self.data:            
             return other.merge(self).compute()
         else:
-            return self.merge_splitted(other.split(self.b.minval), other).compute()
+            a, o, b = other.split_overlap(self.b.minval)
+            @dask.delayed
+            def merge_overlap(a, b):
+                while b is not None and a.maxval > b.minval:
+                    o, b = b.splitleft()
+                    a = a.merge(o).compute()
+                return a.merge(b).compute()
+            return merge_overlap(
+                self.merge2(self.merge2(self.a, a), o),
+                self.merge2(self.b, b)).compute()
 
+    def split_overlap(self, value):
+        """Splits self into a, b and c such that all values in a <
+        value and all values in b >= value. Any of a, b or c can be
+        None. b is guaranteed to not have children.
+        """
+        if self.maxval < value:
+            return self, None, None
+        elif self.minval >= value:
+            return None, None, self
+        elif self.data:
+            return None, self, None
+        else:
+            if self.b.minval < value:
+                a, b, c = self.b.split_overlap(value)
+                return self.a.append(a), b, c
+            else:
+                a, b, c = self.a.split_overlap(value)
+                return a, b, self.b.append(c)
+
+    def splitleft(self):
+        if self.data:
+            return self, None
+        else:
+            a, b = self.a.splitleft()
+            return a, self.b.append(b)
+        
     @dask.delayed
-    def merge_splitted(self, items, other):
+    def merge_splitted(self, items):
         a, b = items
         @dask.delayed
         def construct(a, b):
-            return self.construct(
-                minval=min(self.minval, other.minval),
-                maxval=max(self.maxval, other.maxval),
-                count=self.count + other.count,
-                a=a,
-                b=b)
+            return a.append(b)
         return construct(self.a.merge(a), self.b.merge(b)).compute()
         
     @dask.delayed
@@ -102,28 +157,10 @@ class SortUnit(object):
         else:
             if value < self.b.minval:
                 a, b = self.a.split(value).compute()
-                if b is None:
-                    b = self.b
-                else:
-                    b = self.construct(
-                        minval=b.minval,
-                        maxval=self.maxval,
-                        count=b.count + self.b.count,
-                        a=b,
-                        b=self.b)
-                return a, b
+                return a, self.b.append(b)
             else:
                 a, b = self.b.split(value).compute()
-                if a is None:
-                    a = self.a
-                else:
-                    a = self.construct(
-                        minval=self.minval,
-                        maxval=a.maxval,
-                        count=self.a.count + a.count,
-                        a=self.a,
-                        b=a)
-                return a, b
+                return self.a.append(a), b
 
     @dask.delayed
     def split_simple(self, value):
@@ -188,13 +225,8 @@ class SortUnit(object):
 
         if bout.count == 0:
             return aout
-                            
-        return self.construct(
-            minval=min(aout.minval, bout.minval),
-            maxval=max(aout.maxval, bout.maxval),
-            count=self.count + other.count,
-            a=aout,
-            b=bout)
+
+        return aout.append(bout)
 
     def flatten(self):
         if self.data:
@@ -274,10 +306,6 @@ class MergeSort(object):
     
     def sort_unit(self, *arg, **kwarg):
         return SortUnit(self, *arg, **kwarg)
-
-    @dask.delayed
-    def merge(self, a, b):
-        return a.merge(b).compute()
     
     def merge_sort(self, sort_units, indent='>'):
         count = len(sort_units)
@@ -287,4 +315,4 @@ class MergeSort(object):
             acount = count // 2
             a = self.merge_sort(sort_units[:acount], indent+"a")
             b = self.merge_sort(sort_units[acount:], indent+"b")
-            return self.merge(a, b)
+            return SortUnit.merge2(a, b)
