@@ -122,49 +122,10 @@ class SortUnit(object):
                 return other.append(self)
             elif self.data and other.data:
                 return self.merge_simple(other).compute()
-            elif other.data:
-                return self.merge_splitted(other.split(self.b.minval)).compute()
             elif self.data:            
                 return other.merge(self).compute()
             else:
-                a, o, b = other.split_overlap(self.b.minval)
-                @dask.delayed
-                def merge_overlap(a, b):
-                    while b is not None and a.maxval > b.minval:
-                        o, b = b.splitleft()
-                        with worker_client() as client:
-                            a = a.merge(o).compute()
-                    with worker_client() as client:
-                        return a.merge(b).compute()
-                return merge_overlap(
-                    self.merge2(self.merge2(self.a, a), o),
-                    self.merge2(self.b, b)).compute()
-
-    def split_overlap(self, value):
-        """Splits self into a, b and c such that all values in a <
-        value and all values in b >= value. Any of a, b or c can be
-        None. b is guaranteed to not have children.
-        """
-        if self.maxval < value:
-            return self, None, None
-        elif self.minval >= value:
-            return None, None, self
-        elif self.data:
-            return None, self, None
-        else:
-            if self.b.minval < value:
-                a, b, c = self.b.split_overlap(value)
-                return self.a.append(a), b, c
-            else:
-                a, b, c = self.a.split_overlap(value)
-                return a, b, self.b.append(c)
-
-    def splitleft(self):
-        if self.data:
-            return self, None
-        else:
-            a, b = self.a.splitleft()
-            return a, self.b.append(b)
+                return self.merge_splitted(other.split(self.b.minval)).compute()
         
     @dask.delayed
     def merge_splitted(self, items):
