@@ -1,13 +1,30 @@
+import daskutils.math
+import daskutils.base
+import daskutils.io.msgpack
 import dask.bag
 import dask.distributed
 import os.path
 import uuid
 import msgpack
 import itertools
-import socket
 import contextlib
+import socket
 import subprocess
+import base64
 
+@contextlib.contextmanager
+def worker_client(*arg, **kw):
+    started = False
+    try:
+        with dask.distributed.worker_client(*arg, **kw) as c:
+            started = True
+            yield c
+    except ValueError:
+        if started:
+            raise
+        else:
+            yield None
+        
 @contextlib.contextmanager
 def debugopen(filename, *arg, **kw):
     try:
@@ -15,9 +32,11 @@ def debugopen(filename, *arg, **kw):
             yield f
     except FileNotFoundError:
         base = existing_base(filename)
-        hostname = socket.gethostname()
-        #with open("/etc/host-hostname") as f:
-        #    hostname = f.read().strip()
+        if os.path.exists("/etc/host-hostname"):
+            with open("/etc/host-hostname") as f:
+                hostname = f.read().strip()
+        else:
+            hostname = socket.gethostname()
         raise FileNotFoundError("%s:%s: only %s exists, containing %s" % (hostname, filename, base, os.listdir(base)))
 
 def existing_base(path):
@@ -26,33 +45,6 @@ def existing_base(path):
             return path
         path = os.path.split(path)[0]
     assert False
-
-def merge(a, b, key):
-    """Merges data from two iterators of sorted values into one
-    iterator of sorted values."""
-    
-    a = iter(a)
-    b = iter(b)
-    bpeek = None
-    for aval in a:
-        if bpeek is not None:
-            if key(bpeek) < key(aval):
-                yield bpeek
-                bpeek = None
-        if bpeek is None:
-            for bval in b:
-                if key(bval) < key(aval):
-                    yield bval
-                else:
-                    bpeek = bval
-                    break
-        yield aval
-    if bpeek is not None:
-        yield bpeek
-        bpeek = None
-    for bval in b:
-        yield bval
-
 
 class SortUnit(object):
     def __init__(self, mergesort, minval=None, maxval=None, count=None, data=None, a=None, b=None):
@@ -69,65 +61,80 @@ class SortUnit(object):
         
     def construct(self, *arg, **kwarg):
         return SortUnit(self.mergesort, *arg, **kwarg)
-        
+    
+    @classmethod
+    @dask.delayed
+    def merge2(cls, a, b):
+        with worker_client() as client:
+            return a.merge(b).compute()
+
+    def append(self, other):
+        # Append and create a balanced tree
+        if other is None:
+            return self
+        if self.minval < other.minval:
+            a, b = self, other
+        else:
+            a, b = other, self
+
+        def build_tree(sort_units):
+            count = len(sort_units)
+            if count <= 1:
+                return sort_units[0]
+            else:
+                acount = count // 2
+                a = build_tree(sort_units[:acount])
+                b = build_tree(sort_units[acount:])
+                return self.construct(
+                    minval=a.minval,
+                    maxval=b.maxval,
+                    count=a.count + b.count,
+                    a=a,
+                    b=b)
+        return build_tree(list(a.flatten()) + list(b.flatten()))
+    
     @dask.delayed
     def merge(self, other):
         # print("Merging %s[%s,%s] and %s[%s,%s]" % (self.count, self.minval, self.maxval, other.count, other.minval, other.maxval))
-        if other is None:
-            return self
-        elif self.data and other.data:
-            return self.merge_simple(other).compute()
-        elif self.data:
-            return other.merge(self).compute()
-        else:
-            return self.merge_splitted(other.split(self.b.minval), other).compute()
+        with worker_client() as client:
+            if other is None:
+                return self
+            elif self.maxval < other.minval:
+                return self.append(other)
+            elif other.maxval < self.minval:
+                return other.append(self)
+            elif self.data and other.data:
+                return self.merge_simple(other).compute()
+            elif self.data:            
+                return other.merge(self).compute()
+            else:
+                return self.merge_splitted(other.split(self.b.minval)).compute()
 
     @dask.delayed
-    def merge_splitted(self, items, other):
+    def merge_splitted(self, items):
         a, b = items
         @dask.delayed
         def construct(a, b):
-            return self.construct(
-                minval=min(self.minval, other.minval),
-                maxval=max(self.maxval, other.maxval),
-                count=self.count + other.count,
-                a=a,
-                b=b)
-        return construct(self.a.merge(a), self.b.merge(b)).compute()
+            return a.append(b)
+        with worker_client() as client:
+            return construct(self.a.merge(a), self.b.merge(b)).compute()
         
     @dask.delayed
     def split(self, value):
-        if self.maxval < value:
-            return self, None
-        elif self.minval > value:
-            return None, self
-        elif self.data:
-            return self.split_simple(value).compute()
-        else:
-            if value < self.b.minval:
-                a, b = self.a.split(value).compute()
-                if b is None:
-                    b = self.b
-                else:
-                    b = self.construct(
-                        minval=b.minval,
-                        maxval=self.maxval,
-                        count=b.count + self.b.count,
-                        a=b,
-                        b=self.b)
-                return a, b
+        with worker_client() as client:
+            if self.maxval < value:
+                return self, None
+            elif self.minval > value:
+                return None, self
+            elif self.data:
+                return self.split_simple(value).compute()
             else:
-                a, b = self.b.split(value).compute()
-                if a is None:
-                    a = self.a
+                if value < self.b.minval:
+                    a, b = self.a.split(value).compute()
+                    return a, self.b.append(b)
                 else:
-                    a = self.construct(
-                        minval=self.minval,
-                        maxval=a.maxval,
-                        count=self.a.count + a.count,
-                        a=self.a,
-                        b=a)
-                return a, b
+                    a, b = self.b.split(value).compute()
+                    return self.a.append(a), b
 
     @dask.delayed
     def split_simple(self, value):
@@ -149,7 +156,7 @@ class SortUnit(object):
         }])
         amaxval = self.mergesort.itemkey(
             self.mergesort.loads(
-                subprocess.check_output(["tail", "-n", "1", splitname + "a"]).split(b"||")[1]))
+                subprocess.check_output(["tail", "-n", "1", splitname + "a"]).split(b"||", 1)[1]))
 
         alen = int(subprocess.check_output(["wc", "-l", splitname + "a"]).split(b" ")[0])
         blen = int(subprocess.check_output(["wc", "-l", splitname + "b"]).split(b" ")[0])
@@ -224,15 +231,36 @@ class SortUnit(object):
 class MergeSort(object):
     def __init__(self, tempdir, key=lambda a: a, partition_size=2000):
         self.tempdir = tempdir
-        self.key = key
+        self._key = key
         self.partition_size = partition_size
-        
+
+    def key(self, item):
+        itemkey = self._key(item)
+        if not isinstance(itemkey, (tuple, list)):
+            itemkey = (itemkey,)
+        return itemkey
+    
+    def tempfile(self, *parents, **kw):
+        fileid = str(uuid.uuid4())[:4]
+        if "op" in kw:
+            fileid = fileid + "-" + kw["op"]
+        if parents:
+            parents = [os.path.split(parent)[1][:-len(".msgpack")].split("-")[0] for parent in parents]
+            if len(parents) == 1:
+                parents = parents[0]
+            else:
+                parents = "{%s}" % (",".join(parents))
+            fileid = fileid + "-" + parents
+        return os.path.join(self.tempdir, "%s.msgpack" % (fileid,))
+
     def sort(self, data):
         keytypes = ["n" if type(keypart) in (int, float) else ""
                     for keypart in self.itemkey(data.take(1)[0])]
         self.keydef = ",".join("%s%s" % (idx+1, keytype) for (idx, keytype) in enumerate(keytypes))
 
-        sort_units = data.map_partitions(self.partition_to_sort_unit).compute()
+        filenames = data.map_partitions(self.repartition_and_save)
+        sort_units = [dask.delayed(sort_unit) for sort_unit in filenames.map(self.sort_sort_unit).compute()]
+
         sort_unit = self.merge_sort([dask.delayed(sort_unit) for sort_unit in sort_units])
         sort_unit = sort_unit.compute()
 
@@ -245,10 +273,13 @@ class MergeSort(object):
         return data
 
     def dumps(self, item):
-        return msgpack.dumps(item).replace(b"\\", br"\\").replace(b"\n", br"\n")
+        return base64.b64encode(msgpack.dumps(item))
 
     def loads(self, line):
-        return msgpack.loads(line.strip(b"\n").replace(br"\n", b"\n").replace(br"\\", b"\\"), raw=False)            
+        try:
+            return msgpack.loads(base64.b64decode(line), raw=False)            
+        except Exception as e:
+            raise Exception("%s: %s" % (e, repr(line)))
         
     def itemkey(self, item):
         itemkey = self.key(item)
@@ -258,39 +289,42 @@ class MergeSort(object):
     
     def formatkey(self, itemkey):
         return b"|".join(str(keypart).encode("utf-8") for keypart in itemkey)
-        
-    def partition_to_sort_unit(self, data):
-        filename = os.path.join(self.tempdir, str(uuid.uuid4()))
 
-        minval = None
-        maxval = None
-        count = 0
-        with debugopen(filename, 'wb') as f:
-            for item in data:
-                count += 1
-                itemkey = self.key(item)
-                if not isinstance(itemkey, (tuple, list)):
-                    itemkey = (itemkey,)
-                if minval is None:
-                    minval = itemkey
-                if maxval is None or itemkey > maxval:
-                    maxval = itemkey
-                f.write(self.formatkey(itemkey))
-                f.write(b"||")
-                f.write(self.dumps(item))
-                f.write(b"\n")
-                
-        sortedname = filename + ".sorted"
-        subprocess.check_call(["sort", "-k", self.keydef, "-o", sortedname, filename])
-        
-        return [self.sort_unit(minval=minval, maxval=maxval, count=count, data=sortedname)]
+    def repartition_and_save(self, data):
+        partitionid = self.tempfile()
+        sort_units = []
+        f = None
+        p = 0
+        s = None
+        for idx, item in enumerate(data):
+            part = idx // self.partition_size
+            if f is None or part != p:
+                if f: f.close()
+                p = part
+                filename = self.tempfile(partitionid)
+                f = open(filename, 'wb')
+                s = self.sort_unit(minval=None, maxval=None, count=0, data=filename)
+                sort_units.append(s)
+            itemkey = self.key(item)
+            if s.minval is None or s.minval > itemkey:
+                s.minval = itemkey
+            if s.maxval is None or s.maxval < itemkey:
+                s.maxval = itemkey
+            s.count += 1
+            f.write(self.formatkey(itemkey))
+            f.write(b"||")
+            f.write(self.dumps(item))
+            f.write(b"\n")
+        if f: f.close()
+        return sort_units
+    
+    def sort_sort_unit(self, sort_unit):
+        outfilename = self.tempfile(sort_unit.data, op="sort")
+        subprocess.check_call(["sort", "-k", self.keydef, "-o", outfilename, sort_unit.data])
+        return self.sort_unit(minval=sort_unit.minval, maxval=sort_unit.maxval, count=sort_unit.count, data=outfilename)
     
     def sort_unit(self, *arg, **kwarg):
         return SortUnit(self, *arg, **kwarg)
-
-    @dask.delayed
-    def merge(self, a, b):
-        return a.merge(b).compute()
     
     def merge_sort(self, sort_units, indent='>'):
         count = len(sort_units)
@@ -300,4 +334,4 @@ class MergeSort(object):
             acount = count // 2
             a = self.merge_sort(sort_units[:acount], indent+"a")
             b = self.merge_sort(sort_units[acount:], indent+"b")
-            return self.merge(a, b)
+            return SortUnit.merge2(a, b)
