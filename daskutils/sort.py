@@ -9,7 +9,8 @@ import msgpack
 import itertools
 import contextlib
 import socket
- 
+from dask.distributed import worker_client
+
 @contextlib.contextmanager
 def debugopen(filename, *arg, **kw):
     try:
@@ -69,7 +70,8 @@ class SortUnit(object):
     @classmethod
     @dask.delayed
     def merge2(cls, a, b):
-        return a.merge(b).compute()
+        with worker_client() as client:
+            return a.merge(b).compute()
 
     def append(self, other):
         if other is None:
@@ -88,29 +90,32 @@ class SortUnit(object):
     @dask.delayed
     def merge(self, other):
         # print("Merging %s[%s,%s] and %s[%s,%s]" % (self.count, self.minval, self.maxval, other.count, other.minval, other.maxval))
-        if other is None:
-            return self
-        elif self.maxval < other.minval:
-            return self.append(other)
-        elif other.maxval < self.minval:
-            return other.append(self)
-        elif self.data and other.data:
-            return self.merge_simple(other).compute()
-        elif other.data:
-            return self.merge_splitted(other.split(self.b.minval)).compute()
-        elif self.data:            
-            return other.merge(self).compute()
-        else:
-            a, o, b = other.split_overlap(self.b.minval)
-            @dask.delayed
-            def merge_overlap(a, b):
-                while b is not None and a.maxval > b.minval:
-                    o, b = b.splitleft()
-                    a = a.merge(o).compute()
-                return a.merge(b).compute()
-            return merge_overlap(
-                self.merge2(self.merge2(self.a, a), o),
-                self.merge2(self.b, b)).compute()
+        with worker_client() as client:
+            if other is None:
+                return self
+            elif self.maxval < other.minval:
+                return self.append(other)
+            elif other.maxval < self.minval:
+                return other.append(self)
+            elif self.data and other.data:
+                return self.merge_simple(other).compute()
+            elif other.data:
+                return self.merge_splitted(other.split(self.b.minval)).compute()
+            elif self.data:            
+                return other.merge(self).compute()
+            else:
+                a, o, b = other.split_overlap(self.b.minval)
+                @dask.delayed
+                def merge_overlap(a, b):
+                    while b is not None and a.maxval > b.minval:
+                        o, b = b.splitleft()
+                        with worker_client() as client:
+                            a = a.merge(o).compute()
+                    with worker_client() as client:
+                        return a.merge(b).compute()
+                return merge_overlap(
+                    self.merge2(self.merge2(self.a, a), o),
+                    self.merge2(self.b, b)).compute()
 
     def split_overlap(self, value):
         """Splits self into a, b and c such that all values in a <
@@ -144,23 +149,25 @@ class SortUnit(object):
         @dask.delayed
         def construct(a, b):
             return a.append(b)
-        return construct(self.a.merge(a), self.b.merge(b)).compute()
+        with worker_client() as client:
+            return construct(self.a.merge(a), self.b.merge(b)).compute()
         
     @dask.delayed
     def split(self, value):
-        if self.maxval < value:
-            return self, None
-        elif self.minval > value:
-            return None, self
-        elif self.data:
-            return self.split_simple(value).compute()
-        else:
-            if value < self.b.minval:
-                a, b = self.a.split(value).compute()
-                return a, self.b.append(b)
+        with worker_client() as client:
+            if self.maxval < value:
+                return self, None
+            elif self.minval > value:
+                return None, self
+            elif self.data:
+                return self.split_simple(value).compute()
             else:
-                a, b = self.b.split(value).compute()
-                return self.a.append(a), b
+                if value < self.b.minval:
+                    a, b = self.a.split(value).compute()
+                    return a, self.b.append(b)
+                else:
+                    a, b = self.b.split(value).compute()
+                    return self.a.append(a), b
 
     @dask.delayed
     def split_simple(self, value):

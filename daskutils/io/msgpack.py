@@ -1,7 +1,7 @@
 import dask.bag
 import dask.distributed
-import daskutils.base
 import msgpack
+import uuid
 
 def read(filenames):
     def read(infilepath):
@@ -12,13 +12,11 @@ def read(filenames):
     return filenames.map(lambda x: read(x)).flatten()    
 
 def write(data, filepattern):
-    data = daskutils.base.enumerate(daskutils.base.glom(data))
-    @data.map
-    def write(item):
-        lines, idx = item
-        filename = filepattern % (idx,)
+    @data.map_partitions
+    def write(items):
+        filename = filepattern % (uuid.uuid4(),)
         with open(filename, 'wb') as f:
-            for msg in lines:
+            for msg in items:
                 msgpack.dump(msg, f)
         return filename
     return write
