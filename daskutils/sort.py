@@ -9,8 +9,20 @@ import msgpack
 import itertools
 import contextlib
 import socket
-from dask.distributed import worker_client
 
+@contextlib.contextmanager
+def worker_client(*arg, **kw):
+    started = False
+    try:
+        with dask.distributed.worker_client(*arg, **kw) as c:
+            started = True
+            yield c
+    except ValueError:
+        if started:
+            raise
+        else:
+            yield None
+        
 @contextlib.contextmanager
 def debugopen(filename, *arg, **kw):
     try:
@@ -74,18 +86,29 @@ class SortUnit(object):
             return a.merge(b).compute()
 
     def append(self, other):
+        # Append and create a balanced tree
         if other is None:
             return self
         if self.minval < other.minval:
             a, b = self, other
         else:
-            a, b = other, self        
-        return self.construct(
-            minval=a.minval,
-            maxval=b.maxval,
-            count=a.count + b.count,
-            a=a,
-            b=b)
+            a, b = other, self
+
+        def build_tree(sort_units):
+            count = len(sort_units)
+            if count <= 1:
+                return sort_units[0]
+            else:
+                acount = count // 2
+                a = build_tree(sort_units[:acount])
+                b = build_tree(sort_units[acount:])
+                return self.construct(
+                    minval=a.minval,
+                    maxval=b.maxval,
+                    count=a.count + b.count,
+                    a=a,
+                    b=b)
+        return build_tree(list(a.flatten()) + list(b.flatten()))
     
     @dask.delayed
     def merge(self, other):
